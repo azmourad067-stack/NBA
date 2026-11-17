@@ -10,7 +10,7 @@ from urllib.parse import parse_qsl, urlsplit
 from pathlib import Path
 from typing import Any
 
-APP_BUILD_LABEL = "nba-historical-resumable-pagination-v0.4-2026-11-17"
+APP_BUILD_LABEL = "nba-predictive-engine-v1.0-2026-11-17"
 APP_DIR = Path(__file__).resolve().parent
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
@@ -23,7 +23,6 @@ from collector.api import CreditBudget, DunkAPIClient
 from collector.config import Settings
 from collector.db import EXPECTED_COLUMNS, SupabaseDatabase
 from collector.importer import NBACollector
-from engine.service import build_engine_report
 
 
 st.set_page_config(
@@ -588,53 +587,164 @@ def render_collector(settings: Settings) -> None:
 
 
 
-def render_engine(settings: Settings) -> None:
-    """Read-only model diagnostics; no DunkAPI calls or database writes."""
-    from collector.db import SupabaseDatabase
+def _engine_rows(source: str, settings: Settings | None) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    from engine.service import build_rows
+    from engine.sources import generate_synthetic_league, load_from_database, load_team_names
 
-    st.subheader("Moteur prédictif pré-match · v0.1")
-    st.caption("Calcul en lecture seule depuis Supabase. Aucun appel DunkAPI ni écriture. Le moteur refuse l'entraînement si l'historique est trop court.")
-    min_train_games = st.number_input("Minimum de matchs avant entraînement", min_value=50, max_value=1000, value=100, step=50)
+    if source == "demo":
+        return build_rows(generate_synthetic_league(seasons=3, seed=7)), {}
+    if settings is None:
+        raise RuntimeError("Secrets Supabase absents : utilisez la ligue de démonstration ou configurez SUPABASE_DB_URL.")
+    db = SupabaseDatabase(settings.supabase_db_url, schema=settings.database_schema)
+    try:
+        db.verify_schema()
+        return build_rows(load_from_database(db)), load_team_names(db)
+    finally:
+        db.close()
+
+
+def _fmt_pct(value: Any) -> str:
+    return "—" if value is None else f"{value:.1%}"
+
+
+def render_engine(settings: Settings | None) -> None:
+    """Read-only model diagnostics; no DunkAPI calls or database writes."""
+    from engine import __version__ as engine_version
+    from engine.service import build_report_from_rows
+
+    st.subheader(f"Moteur prédictif pré-match · v{engine_version}")
+    st.caption(
+        "Calcul en lecture seule. Aucun appel DunkAPI ni écriture. Évaluation walk-forward : chaque match test "
+        "est prédit par un modèle entraîné uniquement sur les jours précédents."
+    )
+    c1, c2, c3 = st.columns(3)
+    source_label = c1.selectbox("Source", ["Supabase", "Ligue de démonstration (synthétique)"], index=0 if settings else 1)
+    min_train_games = c2.number_input("Matchs minimum avant 1er entraînement", min_value=50, max_value=5000, value=300, step=50)
+    retrain_every = c3.number_input("Réentraîner tous les N matchs", min_value=25, max_value=1000, value=150, step=25)
+
     if st.button("Construire le dataset et évaluer le moteur", type="primary"):
-        db = None
+        source = "demo" if source_label.startswith("Ligue") else "db"
         try:
-            with st.spinner("Construction chronologique du dataset et évaluation…"):
-                db = SupabaseDatabase(settings.supabase_db_url, schema=settings.database_schema)
-                db.verify_schema()
-                report = build_engine_report(db, min_train_games=int(min_train_games))
-            dataset = report.get("dataset", {})
-            cols = st.columns(4)
-            cols[0].metric("Matchs terminés", dataset.get("games", report.get("games", 0)))
-            cols[1].metric("Matchs à venir", dataset.get("upcoming_games", 0))
-            cols[2].metric("Variables pré-match", dataset.get("feature_count", 0))
-            cols[3].metric("Matchs avec cote PIT", dataset.get("market_feature_coverage", 0))
-            if report["status"] == "insufficient_history":
-                st.warning(report.get("message", "Historique insuffisant pour entraîner le modèle."))
-                st.info("Le moteur ne fabrique pas de modèle avec un échantillon trop petit. Enrichissez d'abord l'historique des matchs terminés et des cotes PIT.")
-            elif report["status"] == "evaluated":
-                st.success(f"Évaluation chronologique : {report['train_games']} matchs d'entraînement, puis {report['test_games']} matchs de test.")
-                st.json(report["metrics"])
-                if report.get("predictions"):
-                    st.dataframe(pd.DataFrame(report["predictions"]), use_container_width=True, hide_index=True)
-            else:
-                st.warning(f"Évaluation non disponible : {report['status']}")
-            upcoming = report.get("upcoming", {})
-            st.divider()
-            st.markdown("#### Prochains matchs")
-            if upcoming.get("status") == "predicted":
-                st.dataframe(pd.DataFrame(upcoming["predictions"]), use_container_width=True, hide_index=True)
-            elif upcoming.get("status") == "insufficient_history":
-                st.info(f"Aucune probabilité future publiée : {upcoming.get('games', 0)} matchs terminés disponibles, historique minimum requis : {min_train_games}.")
-            elif upcoming.get("status") == "no_upcoming_games":
-                st.caption("Aucun match au statut scheduled à prédire.")
-            else:
-                st.caption("Prédictions futures non disponibles pour le moment.")
-            st.caption("Anti-fuite : seules les cotes verified_point_in_time capturées strictement avant scheduled_tipoff_at sont admises. Une évaluation hors-échantillon n'est pas une preuve de rentabilité.")
+            bar = st.progress(0.0, text="Construction chronologique du dataset…")
+            rows, names = _engine_rows(source, settings)
+            bar.progress(0.05, text="Évaluation walk-forward…")
+            report = build_report_from_rows(
+                rows, min_train_games=int(min_train_games), retrain_every=int(retrain_every),
+                progress=lambda f: bar.progress(min(1.0, 0.05 + 0.9 * f), text="Évaluation walk-forward…"),
+            )
+            bar.progress(1.0, text="Terminé")
+            st.session_state["engine_report"] = (report, names, source)
         except Exception as exc:
             st.error(f"Construction du moteur impossible : {exc}")
-        finally:
-            if db is not None:
-                db.close()
+            return
+
+    stored = st.session_state.get("engine_report")
+    if not stored:
+        st.info("Lancez l'évaluation pour afficher les métriques et les probabilités des prochains matchs.")
+        return
+    report, names, source = stored
+    label = lambda tid: names.get(str(tid), str(tid))
+    if source == "demo":
+        st.warning("Données synthétiques : utiles pour vérifier la chaîne, sans valeur prédictive réelle.")
+
+    dataset = report.get("dataset", {})
+    cols = st.columns(5)
+    cols[0].metric("Matchs terminés", dataset.get("games", 0))
+    cols[1].metric("Matchs à venir", dataset.get("upcoming_games", 0))
+    cols[2].metric("Variables pré-match", dataset.get("feature_count", 0))
+    cols[3].metric("Avec box-score", dataset.get("box_score_coverage", 0))
+    cols[4].metric("Avec cote PIT", dataset.get("market_feature_coverage", 0))
+
+    tab_up, tab_eval, tab_bet = st.tabs(["Prochains matchs", "Évaluation", "Backtest value bet"])
+    with tab_up:
+        upcoming = report.get("upcoming", {})
+        if upcoming.get("status") == "predicted":
+            table = pd.DataFrame([{
+                "Date": p["played_at"][:16].replace("T", " "),
+                "Domicile": label(p["home_team_provider_id"]),
+                "Extérieur": label(p["away_team_provider_id"]),
+                "P(dom.)": p["home_win_probability"],
+                "Cote juste dom.": p["fair_home_odds"],
+                "Cote juste ext.": p["fair_away_odds"],
+                "Marge prévue": p["predicted_margin"],
+                "Total prévu": p["predicted_total"],
+                "P marché": p.get("market_home_prob"),
+                "Value bet": (f"{p['value_bet']['side']} @ {p['value_bet']['odds']:.2f} (EV {p['value_bet']['edge']:+.1%})"
+                              if p.get("value_bet") else ""),
+            } for p in upcoming["predictions"]])
+            st.dataframe(
+                table, use_container_width=True, hide_index=True,
+                column_config={
+                    "P(dom.)": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=1),
+                    "P marché": st.column_config.NumberColumn(format="%.3f"),
+                    "Cote juste dom.": st.column_config.NumberColumn(format="%.2f"),
+                    "Cote juste ext.": st.column_config.NumberColumn(format="%.2f"),
+                    "Marge prévue": st.column_config.NumberColumn(format="%+.1f"),
+                    "Total prévu": st.column_config.NumberColumn(format="%.1f"),
+                },
+            )
+            if upcoming.get("importance"):
+                with st.expander("Variables les plus influentes (régression logistique standardisée)"):
+                    st.dataframe(pd.DataFrame(upcoming["importance"]), use_container_width=True, hide_index=True)
+        elif upcoming.get("status") == "insufficient_history":
+            st.info(f"Aucune probabilité publiée : {upcoming.get('games', 0)} matchs terminés, minimum requis : {min_train_games}.")
+        elif upcoming.get("status") == "no_upcoming_games":
+            st.caption("Aucun match au statut scheduled à prédire.")
+        else:
+            st.caption("Prédictions futures non disponibles pour le moment.")
+
+    with tab_eval:
+        if report["status"] == "insufficient_history":
+            st.warning(report.get("message", "Historique insuffisant pour entraîner le modèle."))
+        elif report["status"] != "evaluated":
+            st.warning(f"Évaluation non disponible : {report['status']}")
+        else:
+            st.success(f"{report['test_games']} matchs prédits hors échantillon · {report['split']}")
+            m = report["metrics"]
+            k = st.columns(4)
+            k[0].metric("Précision", _fmt_pct(m.get("accuracy")),
+                        delta=None if m.get("elo_accuracy") is None else f"{(m['accuracy'] - m['elo_accuracy']) * 100:+.1f} pts vs Elo")
+            k[1].metric("Brier score", f"{m['brier_score']:.4f}",
+                        delta=None if m.get("elo_brier_score") is None else f"{m['brier_score'] - m['elo_brier_score']:+.4f} vs Elo",
+                        delta_color="inverse")
+            k[2].metric("Erreur marge (MAE)", f"{m['margin_mae']:.1f} pts")
+            k[3].metric("Erreur total (MAE)", f"{m['total_mae']:.1f} pts")
+            st.markdown("##### Comparaison des modèles")
+            st.dataframe(pd.DataFrame([{"modèle": n, **v} for n, v in report["models"].items()]),
+                         use_container_width=True, hide_index=True)
+            left, right = st.columns(2)
+            with left:
+                st.markdown("##### Calibration")
+                cal = pd.DataFrame(report["calibration"])
+                if not cal.empty:
+                    st.line_chart(cal.set_index("mean_predicted")[["observed_rate"]])
+                    st.dataframe(cal, use_container_width=True, hide_index=True)
+            with right:
+                st.markdown("##### Par saison")
+                st.dataframe(pd.DataFrame(report["by_season"]), use_container_width=True, hide_index=True)
+            if m.get("ats_hit_rate") is not None:
+                st.caption(f"Contre le spread : {_fmt_pct(m['ats_hit_rate'])} sur {m['ats_games']} matchs · "
+                           f"Over/Under : {_fmt_pct(m.get('ou_hit_rate'))} sur {m.get('ou_games', 0)} matchs.")
+            with st.expander("Prédictions hors échantillon (200 dernières)"):
+                st.dataframe(pd.DataFrame(report["predictions"][-200:]), use_container_width=True, hide_index=True)
+
+    with tab_bet:
+        bt = report.get("betting_backtest") or {}
+        if not bt.get("eligible_games"):
+            st.info("Aucune cote moneyline verified_point_in_time dans la période de test : backtest impossible.")
+        else:
+            st.caption(f"Quart de Kelly, mise max {bt['settings']['max_stake']:.0%} de la bankroll, "
+                       f"EV minimum {bt['settings']['min_edge']:.0%}. Cotes médianes des bookmakers, capturées avant le tip-off.")
+            b = st.columns(4)
+            b[0].metric("Paris", bt["bets"], help=f"sur {bt['eligible_games']} matchs éligibles")
+            b[1].metric("ROI", _fmt_pct(bt.get("roi")))
+            b[2].metric("Bankroll", _fmt_pct(bt.get("bankroll_growth")))
+            b[3].metric("Drawdown max", _fmt_pct(bt.get("max_drawdown")))
+    st.caption(
+        "Anti-fuite : variables figées avant chaque match ; seules les cotes verified_point_in_time capturées "
+        "strictement avant scheduled_tipoff_at sont admises. Une évaluation hors échantillon n'est pas une preuve de rentabilité."
+    )
+
 
 def main() -> None:
     load_streamlit_secrets()
@@ -655,7 +765,10 @@ def main() -> None:
     try:
         settings = read_settings()
     except Exception:
-        render_setup_help()
+        if page == "Moteur prédictif":
+            render_engine(None)
+        else:
+            render_setup_help()
         return
 
     try:

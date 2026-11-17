@@ -120,25 +120,67 @@ La préconfiguration du collecteur cible maintenant les saisons régulières 202
 
 Le fournisseur documente `limit`, `offset` et `next_offset` pour `list_games`. Le paramètre saison utilise l'année de fin (2024 = 2023–2024). La reprise s'appuie sur ces curseurs et sur les upserts idempotents.
 
-## Moteur prédictif pré-match v0.1
+## Moteur prédictif pré-match v1.0
 
-Une première chaîne de modélisation est disponible dans `engine/` :
+Le dossier `engine/` contient un moteur complet de prédiction des matchs NBA, en lecture seule (aucun appel DunkAPI, aucune écriture en base).
 
-- dataset chronologique par match, sans utiliser les statistiques du match à prédire ;
-- variables équipe : Elo pré-match, forme des cinq derniers matchs, points pour/contre, adresse, rebonds, passes, pertes de balle et jours de repos ;
-- probabilité moneyline sans marge, calculée à partir de paires de cotes par bookmaker ;
-- filtre strict : `snapshot_time_quality = 'verified_point_in_time'` et `source_captured_at < scheduled_tipoff_at` ;
-- baseline Logistic Regression avec imputation et standardisation ajustées sur l'entraînement ;
-- séparation chronologique 80/20 et comparaison Brier Score avec Elo et marché lorsque disponibles.
+### Ce qu'il prédit
+
+Pour chaque match à venir (`game_status = 'scheduled'`) :
+
+- probabilité de victoire domicile / extérieur et cotes « justes » (1/p) ;
+- marge de points attendue (donc un spread modèle) et total de points attendu ;
+- value bet éventuel : si une cote moneyline `verified_point_in_time` est disponible et que l'espérance de gain dépasse 3 %, le côté, la cote, l'EV et une mise en quart de Kelly (plafonnée à 2 % de la bankroll).
+
+### Architecture
+
+| Module | Rôle |
+| --- | --- |
+| `engine/elo.py` | Elo avec marge de victoire, avantage du terrain (100 pts) et régression de 25 % entre saisons. |
+| `engine/dataset.py` | Variables pré-match chronologiques : Elo, repos, back-to-back, matchs sur 7 jours, forme 5/10 matchs, bilan de saison, moyennes exponentielles des ratings offensif/défensif/net pour 100 possessions, rythme, *four factors* (eFG %, TOV %, ORB %, FTr) et confrontations attaque vs défense adverse. Agrégation des cotes PIT (moneyline sans marge, spread, total). |
+| `engine/models.py` | `PredictionEngine` : régression logistique régularisée, gradient boosting (HistGradientBoosting), régression ridge de la marge (convertie en probabilité via une loi normale), ridge du total, et ensemble moyen. |
+| `engine/evaluation.py` | Backtest walk-forward à fenêtre croissante : réentraînement tous les N matchs, chaque match test prédit par un modèle entraîné uniquement sur les jours précédents. Métriques : précision, Brier, log-loss, AUC, calibration, détail par saison, MAE marge/total, taux contre le spread et over/under quand les lignes existent. |
+| `engine/betting.py` | EV, Kelly fractionnel, simulation chronologique de bankroll sur les prédictions hors échantillon. |
+| `engine/sources.py` | Chargement depuis Supabase, depuis des CSV au format des tables, depuis le fichier public FiveThirtyEight `nbaallelo.csv`, ou génération d'une ligue synthétique pour la démo et les tests. |
+| `engine/service.py` | Orchestration (rapport complet, prédictions, sauvegarde/chargement joblib). |
+
+### Règles anti-fuite
+
+- Les variables d'un match sont figées avant que son score ou son box-score ne mettent à jour l'état des équipes (test : modifier le résultat d'un match ne change aucune variable de ce match ni des précédents).
+- Les matchs à venir ne mettent jamais à jour l'historique.
+- Le découpage walk-forward ne coupe jamais une journée entre entraînement et test.
+- Seules les cotes `verified_point_in_time` capturées strictement avant `scheduled_tipoff_at` sont utilisées. La cote de marché n'entre comme variable que si au moins 60 % des matchs terminés en disposent.
 
 ### Exécution
 
 Depuis `nba_quant_engine_collector/nba_quant_engine` :
 
-    python -m engine.cli --min-train-games 100
+    python -m engine.cli evaluate --source db                    # backtest sur Supabase
+    python -m engine.cli predict --source db                     # probabilités des matchs à venir
+    python -m engine.cli predict --source db --save-model artifacts/engine.joblib
+    python -m engine.cli evaluate --source demo                  # ligue synthétique, hors ligne
+    python -m engine.cli evaluate --source fivethirtyeight --path nbaallelo.csv --first-season 2004 --min-train-games 2400 --retrain-every 300
+    python -m engine.cli evaluate --source csv --games games.csv --team-stats team_stats.csv --odds odds.csv
 
-Cette commande lit uniquement Supabase. Elle ne nécessite pas de clé DunkAPI et ne lance aucune collecte. La page **Moteur prédictif** du dashboard effectue le même calcul en lecture seule.
+`evaluate` affiche un résumé sur stderr et écrit le rapport JSON sur stdout (ou dans `--output`). La page **Moteur prédictif** du tableau de bord fait le même calcul et fonctionne aussi en mode démo sans secrets Supabase.
 
-Le seuil par défaut est de 100 matchs d'entraînement et au moins 25 matchs de test chronologique (125 matchs terminés au total). En dessous, le moteur renvoie `insufficient_history` et ne prétend pas avoir entraîné un modèle. La v0.1 est une baseline de recherche : pas encore de calibration, de modèle joueur, de backtest de mises ni de preuve de rentabilité. Les métriques hors-échantillon doivent être accumulées sur un historique plus large avant toute utilisation opérationnelle.
+### Résultats de référence (vraies données NBA)
 
-La v0.1 inclut aussi l'inférence sur les rencontres au statut `scheduled` : le modèle est réentraîné sur tous les matchs terminés disponibles et produit les probabilités domicile/extérieur uniquement si le seuil d'historique est atteint. Les rencontres à venir ne sont jamais ajoutées à l'historique ni au calcul des labels.
+Backtest walk-forward sur l'historique public FiveThirtyEight (scores uniquement, sans box-scores ni cotes), saisons 2004 à 2015, premier entraînement sur 2 400 matchs, réentraînement tous les 300 matchs : **13 084 matchs prédits hors échantillon**.
+
+| Modèle | Précision | Brier | Log-loss | AUC |
+| --- | --- | --- | --- | --- |
+| Ensemble (moteur) | 67,7 % | 0,2061 | 0,598 | 0,720 |
+| Régression logistique | 67,6 % | 0,2059 | 0,598 | 0,721 |
+| Marge → probabilité | 67,5 % | 0,2062 | 0,598 | 0,721 |
+| Gradient boosting | 67,2 % | 0,2085 | 0,604 | 0,713 |
+| Elo seul | 67,2 % | 0,2072 | 0,601 | 0,719 |
+| Toujours domicile | 60,0 % | 0,2401 | 0,673 | 0,500 |
+
+Erreur absolue moyenne sur la marge : 9,4 points. La calibration est bonne (par exemple, les matchs annoncés entre 80 et 90 % sont gagnés à 84 %). Sur ce jeu de données, les variables issues des box-scores sont absentes ; avec les box-scores DunkAPI, les four factors et ratings par possession sont actifs. Pour comparaison, les marchés de paris NBA atteignent généralement une précision de 68 à 70 % : battre durablement les cotes de clôture reste très difficile.
+
+### Limites
+
+- Pas encore de données joueurs (blessures, absences, minutes), qui expliquent une grande partie de l'écart restant avec le marché.
+- Le backtest de mises n'a de sens qu'avec un historique de cotes PIT suffisant : sans cotes, il est simplement ignoré.
+- Une performance hors échantillon passée n'est pas une garantie de rentabilité future.

@@ -42,6 +42,15 @@ L'ouverture du tableau de bord ne déclenche aucune collecte. Commencer par un p
 Voir nba_quant_engine_collector/nba_quant_engine/README.md pour les instructions locales détaillées et les règles d'intégrité des données.
 
 
-## Moteur prédictif
+## Moteur prédictif v1.0
 
-La branche `feature/streamlit-dashboard` inclut une première baseline pré-match (features chronologiques, Elo, forme équipe, cotes moneyline PIT, validation temporelle 80/20). Elle est accessible depuis la page **Moteur prédictif** ou via `python -m engine.cli --min-train-games 100` depuis `nba_quant_engine_collector/nba_quant_engine`. Le moteur lit Supabase uniquement et ne lance aucune collecte DunkAPI. Voir le README du sous-projet pour les limites et règles anti-fuite.
+Le moteur (`nba_quant_engine_collector/nba_quant_engine/engine/`) produit, pour chaque match à venir, la probabilité de victoire, la marge et le total de points attendus, les cotes justes et un éventuel value bet sur cotes PIT. Il combine Elo avec marge de victoire, forme, repos, ratings par possession, four factors, régression logistique, gradient boosting et régression de marge, évalués par un backtest walk-forward sans fuite temporelle.
+
+Sur 13 084 matchs NBA réels prédits hors échantillon (2005–2015, historique public FiveThirtyEight), le moteur atteint 67,7 % de précision et un Brier score de 0,206, contre 0,207 pour l'Elo seul et 0,240 pour « toujours domicile ».
+
+    cd nba_quant_engine_collector/nba_quant_engine
+    python -m engine.cli evaluate --source db       # backtest sur Supabase
+    python -m engine.cli predict --source db        # prochains matchs
+    python -m engine.cli evaluate --source demo     # démo hors ligne
+
+Le détail (architecture, règles anti-fuite, résultats, limites) est dans le README du sous-projet.
