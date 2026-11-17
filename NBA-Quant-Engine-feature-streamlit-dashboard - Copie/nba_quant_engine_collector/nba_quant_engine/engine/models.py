@@ -15,7 +15,10 @@ from sklearn.preprocessing import StandardScaler
 from .dataset import BASE_FEATURES, CORE_FEATURES, MARKET_FEATURES, TOTAL_FEATURES
 
 PROBABILITY_MODELS = ("elo", "logit", "gbm", "margin", "ensemble")
-ENSEMBLE_MEMBERS = ("logit", "gbm", "margin")
+# Gradient boosting is fitted and reported, but kept out of the ensemble: it was
+# the weakest model out of sample on both FiveThirtyEight history and Supabase data.
+ENSEMBLE_MEMBERS = ("logit", "margin")
+AGREEMENT_MODELS = ("logit", "gbm", "margin", "elo")
 DEFAULT_MARGIN_SIGMA = 12.5
 MIN_GBM_ROWS = 400
 
@@ -45,7 +48,7 @@ class PredictionEngine:
     * ``margin`` — ridge regression on the point margin, converted to a win
       probability through a normal distribution fitted on residuals.
     * ``total``  — ridge regression on the combined score.
-    * ``ensemble`` — average of logit, gbm and margin probabilities.
+    * ``ensemble`` — average of logit and margin probabilities.
     """
 
     use_market: bool = False
@@ -85,7 +88,7 @@ class PredictionEngine:
         self.margin_sigma = float(max(8.0, np.std(residuals)))
         self.models["total"] = _linear(Ridge(alpha=10.0)).fit(x_total, totals)
         self.total_sigma = float(max(8.0, np.std(totals - self.models["total"].predict(x_total))))
-        members = ["logit", "margin"]
+        members = list(ENSEMBLE_MEMBERS)
         # Trees cannot bin a column that is entirely missing (e.g. no box scores).
         observed = ~np.all(np.isnan(x_full), axis=0)
         self.gbm_columns = [c for c, keep in zip(self.full_columns, observed) if keep]
@@ -94,7 +97,6 @@ class PredictionEngine:
                 max_depth=3, learning_rate=0.04, max_iter=250, min_samples_leaf=40,
                 l2_regularization=1.0, random_state=self.random_state,
             ).fit(x_full[:, observed], y)
-            members.append("gbm")
         self.ensemble_members = tuple(members)
         self.home_win_rate = float(y.mean())
         self.train_games = len(train)
@@ -137,6 +139,7 @@ class PredictionEngine:
             for name, values in probs.items():
                 if name != "ensemble":
                     item[f"prob_{name}"] = float(values[i])
+            item.update(model_agreement(item))
             for key in ("market_home_prob", "market_home_odds", "market_away_odds", "market_home_spread", "market_total"):
                 item[key] = row.get(key)
             out.append(item)
@@ -152,3 +155,22 @@ class PredictionEngine:
         names += [f"missing:{self.core_columns[i]}" for i in pipe.named_steps["imputer"].indicator_.features_] if pipe.named_steps["imputer"].indicator_ is not None else []
         pairs = sorted(zip(names, coefs), key=lambda kv: abs(kv[1]), reverse=True)[:top]
         return [{"feature": n, "coefficient": float(c)} for n, c in pairs]
+
+
+def model_agreement(pred: dict[str, Any]) -> dict[str, Any]:
+    """How much the individual models agree on a game.
+
+    ``Fort``: every model and the predicted margin pick the same winner and the
+    probabilities are within 10 points. ``Moyen``: same winner, wider spread.
+    ``Faible``: at least one model (or the margin sign) picks the other team.
+    """
+    probs = [pred[f"prob_{m}"] for m in AGREEMENT_MODELS if pred.get(f"prob_{m}") is not None]
+    favourite_home = pred["home_win_probability"] >= 0.5
+    sides = [p >= 0.5 for p in probs]
+    margin = pred.get("predicted_margin")
+    if margin is not None:
+        sides.append(margin >= 0)
+    spread = (max(probs) - min(probs)) if probs else 0.0
+    same_side = all(s == favourite_home for s in sides)
+    level = "Fort" if same_side and spread <= 0.10 else ("Moyen" if same_side else "Faible")
+    return {"model_spread": float(spread), "agreement": level}

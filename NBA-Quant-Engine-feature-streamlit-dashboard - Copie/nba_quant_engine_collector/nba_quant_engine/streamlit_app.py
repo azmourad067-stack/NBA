@@ -603,6 +603,27 @@ def _engine_rows(source: str, settings: Settings | None) -> tuple[list[dict[str,
         db.close()
 
 
+def _paris_time(iso: str) -> str:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        local = dt.astimezone(ZoneInfo("Europe/Paris"))
+        day = ("lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim.")[local.weekday()]
+        return f"{day} {local:%d/%m %H:%M}"
+    except Exception:
+        return iso[:16].replace("T", " ")
+
+
+def _float_cell(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if number != number else number
+
+
 def _fmt_pct(value: Any) -> str:
     return "—" if value is None else f"{value:.1%}"
 
@@ -610,6 +631,7 @@ def _fmt_pct(value: Any) -> str:
 def render_engine(settings: Settings | None) -> None:
     """Read-only model diagnostics; no DunkAPI calls or database writes."""
     from engine import __version__ as engine_version
+    from engine.betting import evaluate_offer
     from engine.service import build_report_from_rows
 
     st.subheader(f"Moteur prédictif pré-match · v{engine_version}")
@@ -659,11 +681,14 @@ def render_engine(settings: Settings | None) -> None:
     with tab_up:
         upcoming = report.get("upcoming", {})
         if upcoming.get("status") == "predicted":
+            preds = upcoming["predictions"]
             table = pd.DataFrame([{
-                "Date": p["played_at"][:16].replace("T", " "),
+                "Date (Paris)": _paris_time(p["played_at"]),
                 "Domicile": label(p["home_team_provider_id"]),
                 "Extérieur": label(p["away_team_provider_id"]),
                 "P(dom.)": p["home_win_probability"],
+                "Favori": label(p["home_team_provider_id"]) if p["home_win_probability"] >= 0.5 else label(p["away_team_provider_id"]),
+                "Accord modèles": {"Fort": "🟢 Fort", "Moyen": "🟡 Moyen", "Faible": "🔴 Faible"}.get(p.get("agreement"), ""),
                 "Cote juste dom.": p["fair_home_odds"],
                 "Cote juste ext.": p["fair_away_odds"],
                 "Marge prévue": p["predicted_margin"],
@@ -671,18 +696,72 @@ def render_engine(settings: Settings | None) -> None:
                 "P marché": p.get("market_home_prob"),
                 "Value bet": (f"{p['value_bet']['side']} @ {p['value_bet']['odds']:.2f} (EV {p['value_bet']['edge']:+.1%})"
                               if p.get("value_bet") else ""),
-            } for p in upcoming["predictions"]])
+            } for p in preds])
+            if table["P marché"].isna().all():
+                table = table.drop(columns=["P marché", "Value bet"])
             st.dataframe(
                 table, use_container_width=True, hide_index=True,
                 column_config={
-                    "P(dom.)": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=1),
+                    "P(dom.)": st.column_config.ProgressColumn(format="percent", min_value=0, max_value=1),
                     "P marché": st.column_config.NumberColumn(format="%.3f"),
                     "Cote juste dom.": st.column_config.NumberColumn(format="%.2f"),
                     "Cote juste ext.": st.column_config.NumberColumn(format="%.2f"),
                     "Marge prévue": st.column_config.NumberColumn(format="%+.1f"),
                     "Total prévu": st.column_config.NumberColumn(format="%.1f"),
+                    "Accord modèles": st.column_config.TextColumn(
+                        help="Fort : tous les modèles et la marge désignent le même vainqueur, à moins de 10 points d'écart. "
+                             "Moyen : même vainqueur, écart plus large. Faible : au moins un modèle désigne l'autre équipe."),
                 },
             )
+            st.caption("Cote juste = cote minimale pour qu'un pari soit rentable selon le moteur. "
+                       "Évitez les matchs à accord « Faible » : le moteur y est proche du pile ou face.")
+
+            st.markdown("#### Calculateur de value bet")
+            st.caption("Saisissez les cotes décimales de votre bookmaker. Le moteur calcule l'espérance de gain et la mise conseillée "
+                       "(fraction de Kelly, plafonnée).")
+            s1, s2, s3, s4 = st.columns(4)
+            bankroll = s1.number_input("Bankroll (€)", min_value=10.0, value=1000.0, step=50.0)
+            kelly_label = s2.selectbox("Fraction de Kelly", ["1/4 (prudent)", "1/8 (très prudent)", "1/2 (agressif)"])
+            kelly = {"1/4": 0.25, "1/8": 0.125, "1/2": 0.5}[kelly_label.split()[0]]
+            max_stake = s3.slider("Mise max (% bankroll)", 0.5, 5.0, 2.0, 0.5) / 100
+            min_edge = s4.slider("EV minimum (%)", 0.0, 10.0, 3.0, 0.5) / 100
+            offers = pd.DataFrame([{
+                "id": p["game_provider_id"],
+                "Match": f"{label(p['home_team_provider_id'])} – {label(p['away_team_provider_id'])}",
+                "P(dom.)": p["home_win_probability"],
+                "Cote book dom.": None, "Cote book ext.": None,
+            } for p in preds])
+            edited = st.data_editor(
+                offers, hide_index=True, use_container_width=True, key="bookmaker_odds",
+                disabled=["Match", "P(dom.)"], column_order=["Match", "P(dom.)", "Cote book dom.", "Cote book ext."],
+                column_config={
+                    "P(dom.)": st.column_config.NumberColumn(format="percent"),
+                    "Cote book dom.": st.column_config.NumberColumn(min_value=1.01, max_value=50.0, step=0.01, format="%.2f"),
+                    "Cote book ext.": st.column_config.NumberColumn(min_value=1.01, max_value=50.0, step=0.01, format="%.2f"),
+                },
+            )
+            results = []
+            for _, r in edited.iterrows():
+                home_odds, away_odds = _float_cell(r["Cote book dom."]), _float_cell(r["Cote book ext."])
+                if home_odds is None and away_odds is None:
+                    continue
+                o = evaluate_offer(float(r["P(dom.)"]), home_odds, away_odds, bankroll=bankroll,
+                                   kelly_multiplier=kelly, max_stake=max_stake, min_edge=min_edge)
+                home, away = r["Match"].split(" – ", 1)
+                results.append({
+                    "Match": r["Match"],
+                    "EV dom.": o["home_ev"], "EV ext.": o["away_ev"],
+                    "Conseil": (f"Parier {home if o['pick'] == 'home' else away} @ {o['odds']:.2f}" if o["pick"] else "Pas de pari"),
+                    "Mise (€)": round(o["stake"], 2),
+                })
+            if results:
+                st.dataframe(pd.DataFrame(results), hide_index=True, use_container_width=True, column_config={
+                    "EV dom.": st.column_config.NumberColumn(format="percent"),
+                    "EV ext.": st.column_config.NumberColumn(format="percent"),
+                    "Mise (€)": st.column_config.NumberColumn(format="%.2f €"),
+                })
+                st.caption("EV = gain moyen attendu par euro misé. Une EV positive n'est pas une garantie : "
+                           "le moteur reste moins précis que les marchés sur la durée.")
             if upcoming.get("importance"):
                 with st.expander("Variables les plus influentes (régression logistique standardisée)"):
                     st.dataframe(pd.DataFrame(upcoming["importance"]), use_container_width=True, hide_index=True)

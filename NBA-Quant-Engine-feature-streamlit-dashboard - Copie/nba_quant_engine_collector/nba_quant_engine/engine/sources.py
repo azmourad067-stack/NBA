@@ -53,7 +53,7 @@ def load_from_database(db: Any, season_types: tuple[str, ...] = ("regular", "pos
 def load_team_names(db: Any) -> dict[str, str]:
     rows = db.conn.execute(sql.SQL("SELECT team_provider_id, abbreviation, display_name FROM {}.nba_teams").format(
         sql.Identifier(db.schema))).fetchall()
-    return {str(r["team_provider_id"]): str(r.get("abbreviation") or r.get("display_name")) for r in rows}
+    return {str(r["team_provider_id"]): str(r.get("display_name") or r.get("abbreviation")) for r in rows}
 
 
 def _read_csv(path: str | Path | None) -> list[dict[str, Any]]:

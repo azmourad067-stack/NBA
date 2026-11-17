@@ -101,3 +101,29 @@ def simulate_bankroll(
         "settings": {"min_edge": min_edge, "kelly_multiplier": kelly_multiplier, "max_stake": max_stake},
         "history": bets,
     }
+
+
+def evaluate_offer(
+    home_probability: float,
+    home_odds: float | None,
+    away_odds: float | None,
+    bankroll: float = 1000.0,
+    kelly_multiplier: float = 0.25,
+    max_stake: float = 0.02,
+    min_edge: float = 0.03,
+) -> dict[str, Any]:
+    """Score bookmaker prices typed by the user against the model probability."""
+    out: dict[str, Any] = {"home_ev": None, "away_ev": None, "pick": None, "stake": 0.0, "ev": None}
+    best = None
+    for side, prob, odds in (("home", home_probability, home_odds), ("away", 1.0 - home_probability, away_odds)):
+        if odds is None or odds != odds or odds <= 1.0:
+            continue
+        ev = expected_value(prob, odds)
+        out[f"{side}_ev"] = ev
+        if ev >= min_edge and (best is None or ev > best[1]):
+            best = (side, ev, prob, odds)
+    if best:
+        side, ev, prob, odds = best
+        out.update(pick=side, ev=ev, odds=odds,
+                   stake=bankroll * min(max_stake, kelly_multiplier * kelly_fraction(prob, odds)))
+    return out

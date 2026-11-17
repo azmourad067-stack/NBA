@@ -132,3 +132,24 @@ def test_insufficient_history_is_reported_not_faked():
     report = build_report_from_rows(build_rows((games, stats, odds)), min_train_games=100)
     assert report["status"] == "insufficient_history"
     assert report["upcoming"]["status"] == "insufficient_history"
+
+
+def test_model_agreement_flags_disagreement():
+    from engine.models import model_agreement
+
+    base = {"home_win_probability": 0.6, "prob_logit": 0.62, "prob_margin": 0.58, "prob_gbm": 0.6,
+            "prob_elo": 0.61, "predicted_margin": 3.0}
+    assert model_agreement(base)["agreement"] == "Fort"
+    assert model_agreement(dict(base, prob_elo=0.75))["agreement"] == "Moyen"
+    assert model_agreement(dict(base, predicted_margin=-0.5))["agreement"] == "Faible"
+
+
+def test_evaluate_offer_picks_positive_ev_side_and_sizes_stake():
+    from engine.betting import evaluate_offer
+
+    offer = evaluate_offer(0.6, 1.9, 2.0, bankroll=1000, kelly_multiplier=0.25, max_stake=0.05)
+    assert offer["pick"] == "home"
+    assert offer["home_ev"] == pytest.approx(0.14)
+    assert offer["stake"] == pytest.approx(1000 * 0.25 * (0.9 * 0.6 - 0.4) / 0.9)
+    assert evaluate_offer(0.5, 1.8, 1.9)["pick"] is None
+    assert evaluate_offer(0.5, None, None)["pick"] is None
