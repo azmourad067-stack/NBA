@@ -138,9 +138,9 @@ Pour chaque match à venir (`game_status = 'scheduled'`) :
 | --- | --- |
 | `engine/elo.py` | Elo avec marge de victoire, avantage du terrain (100 pts) et régression de 25 % entre saisons. |
 | `engine/dataset.py` | Variables pré-match chronologiques : Elo, repos, back-to-back, matchs sur 7 jours, forme 5/10 matchs, bilan de saison, moyennes exponentielles des ratings offensif/défensif/net pour 100 possessions, rythme, *four factors* (eFG %, TOV %, ORB %, FTr) et confrontations attaque vs défense adverse. Agrégation des cotes PIT (moneyline sans marge, spread, total). |
-| `engine/models.py` | `PredictionEngine` : régression logistique régularisée, gradient boosting (HistGradientBoosting), régression ridge de la marge (convertie en probabilité via une loi normale), ridge du total, et ensemble moyen. |
+| `engine/models.py` | `PredictionEngine` : régression logistique régularisée, gradient boosting (HistGradientBoosting), régression ridge de la marge (convertie en probabilité via une loi normale), ridge du total, et ensemble moyen (logistique + marge ; le gradient boosting est calculé et affiché mais exclu de l'ensemble, car il est le moins bon hors échantillon). Indicateur d'accord entre modèles (Fort / Moyen / Faible). |
 | `engine/evaluation.py` | Backtest walk-forward à fenêtre croissante : réentraînement tous les N matchs, chaque match test prédit par un modèle entraîné uniquement sur les jours précédents. Métriques : précision, Brier, log-loss, AUC, calibration, détail par saison, MAE marge/total, taux contre le spread et over/under quand les lignes existent. |
-| `engine/betting.py` | EV, Kelly fractionnel, simulation chronologique de bankroll sur les prédictions hors échantillon. |
+| `engine/betting.py` | EV, Kelly fractionnel, simulation chronologique de bankroll sur les prédictions hors échantillon, et évaluation de cotes saisies à la main. |
 | `engine/sources.py` | Chargement depuis Supabase, depuis des CSV au format des tables, depuis le fichier public FiveThirtyEight `nbaallelo.csv`, ou génération d'une ligue synthétique pour la démo et les tests. |
 | `engine/service.py` | Orchestration (rapport complet, prédictions, sauvegarde/chargement joblib). |
 
@@ -170,7 +170,7 @@ Backtest walk-forward sur l'historique public FiveThirtyEight (scores uniquement
 
 | Modèle | Précision | Brier | Log-loss | AUC |
 | --- | --- | --- | --- | --- |
-| Ensemble (moteur) | 67,7 % | 0,2061 | 0,598 | 0,720 |
+| Ensemble (moteur) | 67,5 % | 0,2059 | 0,598 | 0,721 |
 | Régression logistique | 67,6 % | 0,2059 | 0,598 | 0,721 |
 | Marge → probabilité | 67,5 % | 0,2062 | 0,598 | 0,721 |
 | Gradient boosting | 67,2 % | 0,2085 | 0,604 | 0,713 |
@@ -178,6 +178,27 @@ Backtest walk-forward sur l'historique public FiveThirtyEight (scores uniquement
 | Toujours domicile | 60,0 % | 0,2401 | 0,673 | 0,500 |
 
 Erreur absolue moyenne sur la marge : 9,4 points. La calibration est bonne (par exemple, les matchs annoncés entre 80 et 90 % sont gagnés à 84 %). Sur ce jeu de données, les variables issues des box-scores sont absentes ; avec les box-scores DunkAPI, les four factors et ratings par possession sont actifs. Pour comparaison, les marchés de paris NBA atteignent généralement une précision de 68 à 70 % : battre durablement les cotes de clôture reste très difficile.
+
+### Résultats sur la base Supabase (novembre 2026)
+
+Backtest walk-forward sur les saisons 2023-24 à 2026-27 collectées (box-scores DunkAPI) : 3 408 matchs prédits hors échantillon.
+
+| Modèle | Précision | Brier | AUC |
+| --- | --- | --- | --- |
+| Marge → probabilité | 67,0 % | 0,2086 | 0,729 |
+| Ensemble (avec gradient boosting, v1.0) | 67,0 % | 0,2092 | 0,728 |
+| Régression logistique | 66,5 % | 0,2092 | 0,727 |
+| Elo seul | 65,8 % | 0,2144 | 0,728 |
+| Gradient boosting | 65,3 % | 0,2170 | 0,710 |
+| Toujours domicile | 54,4 % | 0,2481 | 0,500 |
+
+Le moteur bat l'Elo à chaque saison (2024 : 65,5 % contre 64,4 % ; 2025 : 67,1 % contre 65,2 % ; 2026 : 67,8 % contre 67,6 %).
+
+### Page « Prochains matchs »
+
+- Noms complets des équipes et heure de Paris.
+- Colonne **Accord modèles** : 🟢 Fort (tous les modèles et la marge désignent le même vainqueur, à moins de 10 points d'écart), 🟡 Moyen, 🔴 Faible (au moins un modèle désigne l'autre équipe : à éviter).
+- **Calculateur de value bet** : saisissez les cotes décimales de votre bookmaker ; la page affiche l'EV de chaque côté, le conseil et la mise en euros (bankroll, fraction de Kelly, mise maximale et EV minimum réglables).
 
 ### Limites
 

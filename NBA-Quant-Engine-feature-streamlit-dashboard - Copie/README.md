@@ -46,7 +46,7 @@ Voir nba_quant_engine_collector/nba_quant_engine/README.md pour les instructions
 
 Le moteur (`nba_quant_engine_collector/nba_quant_engine/engine/`) produit, pour chaque match à venir, la probabilité de victoire, la marge et le total de points attendus, les cotes justes et un éventuel value bet sur cotes PIT. Il combine Elo avec marge de victoire, forme, repos, ratings par possession, four factors, régression logistique, gradient boosting et régression de marge, évalués par un backtest walk-forward sans fuite temporelle.
 
-Sur 13 084 matchs NBA réels prédits hors échantillon (2005–2015, historique public FiveThirtyEight), le moteur atteint 67,7 % de précision et un Brier score de 0,206, contre 0,207 pour l'Elo seul et 0,240 pour « toujours domicile ».
+Sur 13 084 matchs NBA réels prédits hors échantillon (2005–2015, historique public FiveThirtyEight), le moteur atteint 67,5 % de précision et un Brier score de 0,206, contre 0,207 pour l'Elo seul et 0,240 pour « toujours domicile ».
 
     cd nba_quant_engine_collector/nba_quant_engine
     python -m engine.cli evaluate --source db       # backtest sur Supabase
